@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import math
+import pandas as pd
+import os
+
+
+##计算“所有生成的线要素”与“起始线要素”的距离
+float_formatter = lambda x: "%.2f" % x
+np.set_printoptions(formatter={'float_kind': float_formatter})
+
+
+def TimeSeriesSimilarityImprove(s1, s2):
+    # 取较大的标准差
+    sdt = np.std(s1, ddof=1) if np.std(s1, ddof=1) > np.std(s2, ddof=1) else np.std(s2, ddof=1)
+    # print("两个序列最大标准差:" + str(sdt))
+    l1 = len(s1)
+    l2 = len(s2)
+    paths = np.full((l1 + 1, l2 + 1), np.inf)  # 全部赋予无穷大
+    sub_matrix = np.full((l1, l2), 0)  # 全部赋予0
+    max_sub_len = 0
+
+    paths[0, 0] = 0
+    for i in range(l1):
+        for j in range(l2):
+            d = s1[i] - s2[j]
+            cost = d ** 2
+            paths[i + 1, j + 1] = cost + min(paths[i, j + 1], paths[i + 1, j], paths[i, j])
+            if np.abs(s1[i] - s2[j]) < sdt:
+                if i == 0 or j == 0:
+                    sub_matrix[i][j] = 1
+                else:
+                    sub_matrix[i][j] = sub_matrix[i - 1][j - 1] + 1
+                    max_sub_len = sub_matrix[i][j] if sub_matrix[i][j] > max_sub_len else max_sub_len
+
+    paths = np.sqrt(paths)
+    s = paths[l1, l2]
+    return s, paths.T, [max_sub_len]
+
+
+def calculate_attenuate_weight(seqLen1, seqLen2, com_ls):
+    weight = 0
+    for comlen in com_ls:
+        weight = weight + comlen / seqLen1 * comlen / seqLen2
+    return 1 - weight
+
+
+if __name__ == '__main__':
+    # 测试数据
+    # data是刚才生成的csv路径
+    data = pd.read_csv(r'D:\work\arcpy\profile\auv\smooth_test\test10m\result\Profiles1.csv', encoding='utf-8')
+    update_pre = {}
+    updata_late = {}
+    similarity_update_pre = {}
+    similarity_updata_late = {}
+    s1 = np.array(data['profile_1'])
+
+    for i in range(2, 10000):
+        s = np.array(data["profile_"+str(i)])
+        distance, paths, max_sub = TimeSeriesSimilarityImprove(s1, s)
+        # print("更新前s1和s" + str(i) + "距离：" + str(distance))
+        update_pre["profile_"+str(i)] = distance
+        similarity_update_pre["profile_"+str(i)] = 1/(1+distance)
+        # 衰减系数
+        weight12 = calculate_attenuate_weight(len(s1), len(s), max_sub)
+        # print("更新后s1和s" + str(i) + "距离：" + str(distance * weight12))
+        updata_late["profile_"+str(i)] = distance * weight12
+        similarity_updata_late["profile_"+str(i)] = 1/(1+distance*weight12)
+
+    # 更新前后的distance升序排列
+    update_pre = sorted(update_pre.items(), key=lambda item: item[1], reverse=False)
+    updata_late = sorted(updata_late.items(), key=lambda item: item[1], reverse=False)
+    print("distance更新前升序", update_pre)
+    print("distance更新后升序", updata_late)
+    pre = []
+    last = []
+    for i in range(len(update_pre)):
+        pre.append(update_pre[i][0])
+        last.append(updata_late[i][0])
+    print("distance更新前升序", pre)
+    print("distance更新后升序", last)
+
+    # 更新前后的similarity升序排列
+    similarity_update_pre = sorted(similarity_update_pre.items(), key=lambda item: item[1], reverse=True)
+    similarity_updata_late = sorted(similarity_updata_late.items(), key=lambda item: item[1], reverse=True)
+    print("similarity更新前降序", similarity_update_pre)
+    print("similarity更新后降序", similarity_updata_late)
+    similarity_pre = []
+    similarity_last = []
+    for i in range(len(similarity_update_pre)):
+        pre.append(similarity_update_pre[i][0])
+        last.append(similarity_updata_late[i][0])
+    print("similarity更新前降序", pre)
+    print("similarity更新后降序", last)
+
+dataframe = pd.DataFrame({"distance更新前升序":update_pre,"distance更新后升序": updata_late,'similarity更新前降序':similarity_update_pre,'similarity更新后降序':similarity_updata_late})
+dataframe.to_csv(r'D:\work\arcpy\profile\auv\smooth_test\test10m\null.csv',index=False,sep=',')
