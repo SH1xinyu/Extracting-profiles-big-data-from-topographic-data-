@@ -1,0 +1,357 @@
+#coding=utf-8
+
+# Import system modules
+from pylab import *
+import arcpy
+import pandas as pd
+import pyproj
+import time,os
+from pyproj import CRS
+
+def ReadSeedShp(seedFeature):
+    cursor = arcpy.da.SearchCursor(seedFeature, ["SHAPE@"])
+
+    # 读取原始线要素
+    res = []
+    for row in cursor:
+        for part in row[0]:
+            for pnt in part:
+                point = arcpy.Point()
+                if pnt:
+                    # 记录线的节点
+                    point.X ,point.Y = pnt.X ,pnt.Y
+                    res.append(point)
+    del cursor
+    del row
+    return res
+
+# 读取线要素的坐标以及id
+def ReadLinesShp(seedFeature):
+    cursor = arcpy.da.SearchCursor(seedFeature, ["SHAPE@","uid"])
+
+    # 读取原始线要素
+    res = {}
+    for row in cursor:
+        points = []
+        for part in row[0]:
+            for pnt in part:
+                point = arcpy.Point()
+                if pnt:
+                    # 记录线的节点
+                    point.X ,point.Y = pnt.X  ,pnt.Y
+                    points.append(point)
+        res[row[1]] = points
+    del cursor
+    del row
+    return res
+
+# 计算所有的偏移线
+def OffsetLines(seedFeature, offsetX,offSetY,leftXOffSetNumber, rightOffSetNumber, downXOffSetNumber, upOffSetNumber):
+    # 读取原始的线要素
+    seedPolyline = ReadSeedShp(seedFeature)
+    polylines = []
+    count = 0
+    spatialRef = arcpy.SpatialReference(4326)
+    # 遍历所有的偏移变量
+    for i in range(leftXOffSetNumber,rightOffSetNumber + 1,1):
+        for j in range(downXOffSetNumber,upOffSetNumber + 1,1):
+            newPolylineList = []
+            # 根据原始线的坐标计算偏移后的坐标
+            for pnt in seedPolyline:
+                point = arcpy.Point()
+                curOffSetX = offsetX * i
+                curOffsetY = offSetY * j
+                x, y = CoordinateTransform(pnt.X  , pnt.Y)
+                x, y = x + curOffSetX, y + curOffsetY
+                point.X, point.Y = XYTransform(x , y)
+                point.X = point.X 
+                newPolylineList.append(point)
+            # 根据坐标列表生成arcpy的线要素，并写入数据
+            polyline = arcpy.Polyline(arcpy.Array(newPolylineList),spatialRef)
+            polylines.append(polyline)
+
+    return polylines
+
+
+def CoordinateTransform(lon, lat):
+    # p1 = pyproj.Proj(init="ESRI:4326")  # 定义数据地理坐标系
+    # p2 = pyproj.Proj(init="ESRI:3857")  # 定义转换投影坐标系
+    # x1, y1 = p1(lon, lat)
+    # x2, y2 = pyproj.transform(p1, p2, x1, y1)  #有x2, y2 = pyproj.transform(p1, p2, x1, y1,radians=True)，py2可用；删除,radians=True，py3可用
+    crs_4326 = CRS("WGS84")
+    crs_proj = CRS.from_epsg(3857)
+    transformer = pyproj.Transformer.from_crs(crs_4326, crs_proj)
+    x1, y1 = transformer.transform(lon,lat)
+    return x1, y1
+
+def XYTransform(x, y):
+    # p1 = pyproj.Proj(init="+init=ESRI:4326")  # 定义数据地理坐标系
+    # p2 = pyproj.Proj(init="+init=ESRI:3857")  # 定义转换投影坐标系
+    crs_4326 = CRS("WGS84")
+    crs_proj =  CRS.from_epsg(3857)
+    transformer = pyproj.Transformer.from_crs(crs_proj, crs_4326)
+    x1, y1 = transformer.transform(x, y)
+    print(x1,y1)
+    return x1,y1
+
+# 计算上下左右的偏移量
+def CalculateOffsetNumber(lineFile,RasterFile,offsetX,offsetY):
+    # 获取线的范围，并计算线在xy方向的长度
+    lineExtent = arcpy.Describe(lineFile).extent
+    lineXMin, lineXMax, lineYMin, lineYMax =  lineExtent.XMin,lineExtent.XMax ,  lineExtent.YMin,lineExtent.YMax
+    lineXMinProj, lineYMinProj = CoordinateTransform(lineXMin, lineYMin)
+    lineXMaxProj, lineYMaxProj = CoordinateTransform(lineXMax, lineYMax)
+    #获取栅格的范围，注意
+    rasterExtent = arcpy.sa.Raster(RasterFile).extent
+    rasterXMin, rasterXMax, rasterYMin, rasterYMax = rasterExtent.XMin, rasterExtent.XMax , rasterExtent.YMin, rasterExtent.YMax,
+    print("栅格范围",rasterXMin, rasterXMax, rasterYMin, rasterYMax)
+    #如果栅格的经度大于180，则减去360，使其范围位于-180至180
+    rasterXMin = rasterXMin - 360 if rasterXMin > 180 else rasterXMin
+    rasterXMax = rasterXMax - 360 if rasterXMax > 180 else rasterXMax
+    #分别计算上下左右的最多偏移次数
+    rasterXMinProj, rasterYMinProj = CoordinateTransform(rasterXMin, rasterYMin)
+    rasterXMaxProj, rasterYMaxProj = CoordinateTransform(rasterXMax, rasterYMax)
+    leftXOffSetNumber = - int(math.floor((lineXMinProj - rasterXMinProj) / offsetX ))
+    rightOffSetNumber = int(math.floor((rasterXMaxProj - lineXMaxProj) / offsetX ))
+    downXOffSetNumber = - int(math.floor((lineYMinProj - rasterYMinProj) / offsetY ))
+    upOffSetNumber = int(math.floor((rasterYMaxProj - lineYMaxProj) / offsetY ))
+    return leftXOffSetNumber, rightOffSetNumber, downXOffSetNumber, upOffSetNumber
+
+
+#根据上下左右偏移量，计算所有的线
+def CreateAllOffsetLines(seedFeature,rasterFile,lineFileFolder,offsetX,offSetY,step):
+    #计算上下左右的偏移量
+    leftXOffSetNumber, rightOffSetNumber, downXOffSetNumber, upOffSetNumber = CalculateOffsetNumber(seedFeature,rasterFile,offsetX,offSetY)
+    offLines = OffsetLines(seedFeature, offsetX, offSetY, leftXOffSetNumber, rightOffSetNumber,downXOffSetNumber, upOffSetNumber)
+    allOffLineFiles = []
+    lineNums = len(offLines)
+    startTime = time.time()
+    for i in range(0,lineNums,step):
+        startIndex = i
+        endIndex = i + step if i+ step <= lineNums else lineNums
+        #循环进行偏移
+
+        # 存储所有剖面线的shp
+        newFileName ="offLines_{0}_{1}.shp".format(startIndex,endIndex)
+        newFilePath = lineFileFolder + "\\" +  newFileName
+        allOffLineFiles.append(newFilePath)
+        # 创建空shapefile，坐标系为wgs84
+        arcpy.CreateFeatureclass_management(lineFileFolder, newFileName, "Polyline", "", "", "", "4326")
+        # 添加属性字段
+        projRefer = arcpy.Describe(newFilePath).spatialReference
+        projRefer.XYResolution = 0.00000001
+        arcpy.AddField_management(newFilePath, "uid", "Long", "", "", "", "", "")
+        cursor = arcpy.da.InsertCursor(newFilePath, ["SHAPE@", "uid"])
+        #根据偏移量更新线的坐标,并返回每条线id以及起点和终点坐标
+        for index in range(startIndex,endIndex,1):
+            cursor.insertRow([offLines[index],index])
+        del cursor
+        
+
+    MergeLineFile = lineFileFolder + "\\" + "offLines_merge.shp"
+    print(allOffLineFiles,MergeLineFile)
+    arcpy.Merge_management(allOffLineFiles, MergeLineFile)
+    arcpy.AddMessage("success calculate all lines ")
+    endTime = time.time()
+    print("CreateAllOffsetLines:{0}".format(endTime-startTime))
+    return MergeLineFile
+#计算剖面
+def GetProfile(shpFolder,RasterFile,outFolder):
+    files = os.listdir(shpFolder)
+    for file in files:
+        if not file.endswith(".shp"):
+            continue
+        if "merge" in file:
+            continue
+        startTime = time.time()
+        lineFile = shpFolder + "\\" + file
+        outTablePath = outFolder +"\\" + file.replace(".shp","_table")
+        outCsvPath = outTablePath.replace("_table", ".csv")
+        outCsvLoc = "/".join(outCsvPath.split("\\")[:-1])
+        outCsvName = outCsvPath.split("\\")[-1]
+        #调用构建剖面的函数，生成剖面
+        #详细函数可以参考https://desktop.arcgis.com/zh-cn/arcmap/10.3/tools/3d-analyst-toolbox/stack-profile.htm
+        arcpy.StackProfile_3d(lineFile, RasterFile,outTablePath)
+        #将剖面的结果表格导出为csv，方便读取
+        arcpy.TableToTable_conversion(outTablePath, outCsvLoc, outCsvName)
+
+        arcpy.AddMessage("success print profile csv :{0}".format(outCsvPath))
+        endTime = time.time()
+        print("GetProfile {1}:{0}".format(endTime - startTime,outTablePath))
+
+#读取csv数据，只读取用于绘制剖面图的x列y列，根据id区分剖面线所属于的线
+def ReadCsvData(csvFile,idname,xname,yname):
+    data = pd.read_csv(csvFile)
+    id = data[idname]
+    x = data[xname]
+    y = data[yname]
+    preId = id[0]
+    xById = []
+    yById = []
+    res ={}
+    for i in range(len(id)):
+        if id[i] == preId:
+            xById.append(x[i])
+            yById.append(y[i])
+        else:
+            res[preId] =[xById,yById]
+            preId = id[i]
+            xById =[x[i]]
+            yById =[y[i]]
+    res[preId] = [xById, yById]
+    return res
+
+
+#绘制剖面图
+def PrintProfileImage(x_axis_data,y_axis_data,outGraphPath,minValue, maxValue,lineLength):
+    startTime = time.time()
+    #生成剖面图
+    plt.plot(x_axis_data, y_axis_data, 'r-', color='#4169E1', alpha=0.8, linewidth=1,label="profile")
+    # 图例位置
+    plt.legend().remove()
+    # 设置y轴范围
+    plt.ylim(minValue, maxValue)
+    # 设置x轴范围
+    plt.xlim(0, lineLength)
+    # x轴标签
+    plt.xlabel(u'distance')
+    # y轴标签
+    plt.ylabel(u'height')
+    # 保存图片
+    plt.savefig(outGraphPath)
+
+    arcpy.AddMessage("success print profile image :{0}".format(outGraphPath))
+    # 清空折线图
+    plt.clf()
+    endTime = time.time()
+    print("PrintProfileImage:{0}".format(endTime - startTime))
+
+#绘制所有的图片
+def PrintProfileImages(ProfileFolder, outGraphFolder, minValue, maxValue, lineLength):
+    #读取x轴以及y轴的数据
+    for file in os.listdir(ProfileFolder):
+        if not file.endswith(".csv"):
+            continue
+        csvFile = ProfileFolder + "\\" + file
+        startIndex = int(file.split("_")[1])
+        allLineValues = ReadCsvData(csvFile,"LINE_ID" ,"FIRST_DIST", "FIRST_Z")
+        startIndex = int(file.split("_")[1])
+        for k,v in allLineValues.items():
+            x = v[0]
+            y = v[1]
+            #输出图片的路径名
+            outGraphPath = outGraphFolder +"\\profile_{0}.png".format(k+startIndex)
+            if  os.path.exists(outGraphPath):
+                continue
+            #绘制图片
+            PrintProfileImage(x, y, outGraphPath,minValue, maxValue, lineLength)
+            print(outGraphPath)
+        del allLineValues
+
+def ProfileTable(ProfileFolder, outProfileCsv):
+    f = open(outProfileCsv, "w")
+    for file in os.listdir(ProfileFolder):
+        if not file.endswith(".csv"):
+            continue
+        #读取线要素编号、x轴以及y轴的数据
+        print("reading profile data")
+        csvFile = ProfileFolder + "\\" + file
+        allLineValues = ReadCsvData(csvFile,"LINE_ID" ,"FIRST_DIST", "FIRST_Z")
+
+        startIndex = int(file.split("_")[1])
+        print("finish reading profile data")
+
+        print("writing profile data")
+
+        #  记录数据
+        for k, v in allLineValues.items():
+            print("write line profile {}".format(k+startIndex))
+            string = "line_{},".format(k+startIndex)
+            for item in v[1]:
+                string += "{},".format(item)
+            string += "\n"
+            f.write(string)
+    print("finish writing profile data")
+
+
+#输出图片名和对应的线的起点和终点坐标
+def OutputFigNameAndLinePoint(fileName,outPath):
+    print("reading lines shapefile")
+    lines = ReadLinesShp(fileName)
+    print("finish reading lines shapefile")
+
+    #打开文件，写入表头
+    f = open(outPath,"w")
+    head = "figName,startX,startY,"
+
+    strings = []
+    pointCount = 0
+    #根据id以及坐标构建每一行数据，并写入文件
+    for id,points in lines.items():
+        pointCount = len(points)
+        string = "profile_{0}.png,".format(id)
+        for point in points:
+            string += "{0},{1},".format(point.X ,point.Y)
+        strings.append(string[:-1] + '\n')
+
+    for i in range(1,pointCount):
+        head += "iP{0}X,iP{1}Y,".format(i, i)
+    f.write(head +"\n")
+    f.writelines(strings)
+    print("finish writing lines shapefile")
+
+#计算输入的线的长度（degree），使得所有生成的剖面图的x轴都一样
+def CalculateLineLength(lineFile):
+    pList = []
+
+    cursor = arcpy.da.UpdateCursor(lineFile,spatial_reference=arcpy.SpatialReference(4326), field_names="SHAPE@")
+    for row in cursor:
+        for part in row[0]:
+            for pnt in part:
+                if pnt:
+                    pList.append([pnt.X , pnt.Y])
+    sumDis = 0
+    for i in range(0,len(pList)-1):
+        startP = pList[i]
+        endP = pList[i + 1]
+        dis = math.sqrt( (startP[0] - endP[0]) * (startP[0] - endP[0]) + (startP[1] - endP[1]) * (startP[1] - endP[1]))
+        sumDis += dis
+    return sumDis
+
+
+if __name__ == "__main__":
+    arcpy.CheckOutExtension('3D')
+    arcpy.env.XYResolution = "0.000000002 Degree"
+    arcpy.env.XYTolerance = "0.000000002 Degree"
+    line = "D:\\work\\arcpy\\profile\\auv\\smooth_lines\\smooth_100m.shp"
+    Raster = "D:\\work\\arcpy\\profile\\auv\\object_areaup"
+    tempFolder = "D:\\work\\arcpy\\profile\\auv\\smooth_test\\test10m\\up_test\\process"
+    outGraphFolder = "D:\\work\\arcpy\\profile\\auv\\smooth_test\\test10m\\up_test\\result"
+
+    offSetX = 1
+    offSetY = 1
+    #读取栅格的最大值
+    numpyR = arcpy.RasterToNumPyArray(Raster)
+    maxValue = np.max(numpyR)
+    maxValue = -2482    # 这里最大最小值的获取有时候不准确，建议根据arcmap中显示的来手动修改
+    #将栅格的空值设置为0，便于读取栅格的最小值
+    numpyR2 = arcpy.RasterToNumPyArray(Raster, nodata_to_value=0)
+    minValue = np.min(numpyR2)
+    print(minValue,maxValue)
+    #计算线的长度
+    lineLength = CalculateLineLength(line)
+    # 每个偏移线中线条的数量
+    step = 10000
+    # 生成偏移线，
+    mergeFile = CreateAllOffsetLines(line,Raster,tempFolder,offSetX,offSetY,step)
+    # 计算剖面
+    GetProfile(tempFolder, Raster,tempFolder)
+    # 将剖面计算结果绘制成图片
+    PrintProfileImages(tempFolder, outGraphFolder, minValue, maxValue, lineLength)
+    # 输出剖面数据的路径
+    outProfilePath = outGraphFolder + "\\Profiles.csv"
+    ProfileTable(tempFolder, outProfilePath)
+    # 输出线要素的节点文件
+    outFigNamePath = outGraphFolder + "\\figNameAndLines.csv"
+    # mergeFile =tempFolder + "\\offLines_merge.shp"
+    OutputFigNameAndLinePoint(mergeFile, outFigNamePath)
